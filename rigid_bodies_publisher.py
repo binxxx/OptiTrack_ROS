@@ -11,9 +11,10 @@ import tf.transformations as tr
 from hrl_geom.pose_converter import PoseConv
 # Messages
 from geometry_msgs.msg import Pose, Point, Quaternion
-from optitrack.msg import RigidBody, RigidBodyArray
+from optitrack.msg import RigidBody, RigidBodyArray, Odometry
 import IPython
 import struct as struct
+
 
 class RigidBodiesPublisher(object):
   """
@@ -36,6 +37,10 @@ class RigidBodiesPublisher(object):
       ids.append(value)
     # Setup Publishers
     pose_pub = rospy.Publisher('/optitrack/rigid_bodies', RigidBodyArray, queue_size=3)
+    pose_act_pub = rospy.Publisher('/optitrack/odometry/act_pose', Odometry, queue_size=3)
+    # pose_act_pub = rospy.Publisher('/optitrack/odometry/act_pose', Odometry, queue_size=3)
+
+
     # Setup TF listener and broadcaster
     tf_listener = tf.TransformListener()
     tf_broadcaster = tf.TransformBroadcaster()
@@ -48,7 +53,7 @@ class RigidBodiesPublisher(object):
     # optitrack = rx.mkdatasock(ip_address=iface)
     optitrack = rx.mkcmdsock(ip_address=iface)
     msg = struct.pack("I", rx.NAT_PING)
-    server_address = '192.168.1.205'
+    server_address = '192.168.1.147'
     result = optitrack.sendto(msg, (server_address, rx.PORT_COMMAND))
 
 
@@ -59,7 +64,7 @@ class RigidBodiesPublisher(object):
       now = rospy.Time.now() + rospy.Duration(1.0)
       tf_listener.waitForTransform(parent, child, now, rospy.Duration(5.0))
       (pos,rot) = tf_listener.lookupTransform(parent, child, now)
-      wTo = PoseConv.to_homo_mat(pos, rot)
+      wTo = PoseConv.to_homo_mat(pos, rot)  # return 4x4 numpy mat
     except (tf.Exception, tf.LookupException, tf.ConnectivityException):
       rospy.logwarn('Failed to get transformation from %r to %r frame' % (parent, child))
       parent_frame = optitrack_frame
@@ -69,8 +74,11 @@ class RigidBodiesPublisher(object):
     # IPython.embed()
     while not rospy.is_shutdown():
       try:
-        # data = optitrack.recv(rx.MAX_PACKETSIZE)
-        data, address = optitrack.recvfrom(rx.MAX_PACKETSIZE + 4)
+        data = optitrack.recv(rx.MAX_PACKETSIZE)
+        # IPython.embed()
+        # data, address = optitrack.recvfrom(rx.MAX_PACKETSIZE + 4)
+        # IPython.embed()
+        # rospy.loginfo("here")
       except socket.error:
         if rospy.is_shutdown():  # exit gracefully
           return
@@ -83,22 +91,69 @@ class RigidBodiesPublisher(object):
       if type(packet) in [rx.SenderData, rx.ModelDefs, rx.FrameOfData]:
         # Optitrack gives the position of the centroid. 
         array_msg = RigidBodyArray()
+        pose_act_msg = Odometry()
         # IPython.embed()
         if msgtype == rx.NAT_FRAMEOFDATA:
-          # IPython.embed()
+          # loop through all the rigid bodies
+          # use only one for right now
           for i, rigid_body in enumerate(packet.rigid_bodies):
             body_id = rigid_body.id
+
+            # IPython.embed()
+
             pos_opt = np.array(rigid_body.position)
             rot_opt = np.array(rigid_body.orientation)
+            # IPython.embed()
             oTr = PoseConv.to_homo_mat(pos_opt, rot_opt)
-            # Transformation between world frame and the rigid body
-            wTr = np.dot(wTo, oTr)
+            # Transformation between world frame and the rigid body            
+            WTr = np.dot(wTo, oTr)
+            wTW = np.array([[0,-1,0,0],[1,0,0,0],[0,0,1,0],[0,0,0,1]])
+            wTr = np.dot(wTW,WTr)
+
+            ## New Change ##
+            # Toffset = np.array( [[0, 1, 0, 0],[0, 0, 1, 0],[1, 0, 0, 0],[0, 0, 0, 1]] )
+            # tf_wTr = np.dot(oTr,Toffset)
+            # tf_pose = Pose()
+            # tf_pose.position = Point(*tf_wTr[:3,3])
+            # tf_pose.orientation = Quaternion(*tr.quaternion_from_matrix(tf_wTr))
+
+            # IPython.embed()
+
             array_msg.header.stamp = rospy.Time.now()
             array_msg.header.frame_id = parent_frame
             body_msg = RigidBody()
             pose = Pose()
             pose.position = Point(*wTr[:3,3])
-            pose.orientation = Quaternion(*tr.quaternion_from_matrix(wTr))
+            # OTr = np.dot(oTr,Toffset)
+            # pose.orientation = Quaternion(*tr.quaternion_from_matrix(oTr))
+
+            # change 26 Feb. 2017
+            # get the euler angle we want then compute the new quaternion
+            euler = tr.euler_from_quaternion(rot_opt)
+            quaternion = tr.quaternion_from_euler(euler[2],euler[0],euler[1])
+            pose.orientation.x = quaternion[0]
+            pose.orientation.y = quaternion[1]
+            pose.orientation.z = quaternion[2]
+            pose.orientation.w = quaternion[3]
+
+            # change made 11 july, 2017
+            # directly get position and orientation information
+            roll = euler[2]*180/np.pi
+            pitch = euler[0]*180/np.pi
+            yaw = euler[1]*180/np.pi
+
+            # set up pose_act_msg publisher
+            pose_act_msg.header.stamp = array_msg.header.stamp
+            pose_act_msg.header.frame_id = parent_frame
+            # add velocity estimation later
+            # pose_act_msg.vel
+            pose_act_msg.position = pose.position
+            pose_act_msg.yaw = yaw
+            pose_act_msg.euler.x = roll
+            pose_act_msg.euler.y = pitch
+            pose_act_msg.euler.z = yaw
+            pose_act_msg.tracking_valid = rigid_body.tracking_valid
+
             body_msg.id = body_id
             body_msg.tracking_valid = rigid_body.tracking_valid
             body_msg.mrk_mean_error = rigid_body.mrk_mean_error
@@ -110,12 +165,33 @@ class RigidBodiesPublisher(object):
             # Control the publish rate for the TF broadcaster
             if rigid_body.tracking_valid and (rospy.get_time()-prevtime[body_id] >= tf_period):
               body_name = 'rigid_body_%d' % (body_id)
-              if body_id in ids:
-                idx = ids.index(body_id)
-                body_name = names[idx]
-              tf_broadcaster.sendTransform(pos_opt, rot_opt, rospy.Time.now(), body_name, optitrack_frame)
+              # if body_id in ids:
+              #   idx = ids.index(body_id)
+              #   body_name = names[idx]
+              ## no change ##
+              # tf_broadcaster.sendTransform(pos_opt, rot_opt, rospy.Time.now(), body_name, optitrack_frame)
+              # change 1 ## 
+              # pos2 = np.array([tf_pose.position.x, tf_pose.position.y, tf_pose.position.z])
+              # rot2 = np.array([tf_pose.orientation.x, tf_pose.orientation.y, tf_pose.orientation.z, tf_pose.orientation.w])
+              # tf_broadcaster.sendTransform(pos2, rot2, rospy.Time.now(), body_name, optitrack_frame)
+              ## change 2 ## <fail>
+              # pos2 = np.array([-pose.position.y, pose.position.x, pose.position.z])
+              # rot2 = np.array([-pose.orientation.y, pose.orientation.x, pose.orientation.z, pose.orientation.w])
+              # tf_broadcaster.sendTransform(pos2, rot2, rospy.Time.now(), body_name, optitrack_frame)
+              ## change 3 ## <fail>
+              # pos2 = np.array([-pos_opt[1],pos_opt[0],pos_opt[2]])
+              # rot2 = np.array([-rot_opt[1],rot_opt[0],rot_opt[2],rot_opt[3]])
+              # tf_broadcaster.sendTransform(pos2, rot2, rospy.Time.now(), body_name, optitrack_frame)
+              ## change 4 ## <>
+              pos2 = np.array([pose.position.x, pose.position.y, pose.position.z])
+              rot2 = np.array([pose.orientation.x, pose.orientation.y, pose.orientation.z,pose.orientation.w])
+              tf_broadcaster.sendTransform(pos2, rot2, rospy.Time.now(), body_name, parent_frame)
+
               prevtime[body_id] = rospy.get_time()
+
         pose_pub.publish(array_msg)
+        pose_act_pub.publish(pose_act_msg)
+
 
 
 if __name__ == '__main__':
